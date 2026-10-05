@@ -1,7 +1,16 @@
-# Dataset
+## 📊 Data
 
-The dataset used in this project can be downloaded from:
+The dataset used in this project is retrieved directly from the Binance API.  
+No raw dataset files are stored in this repository. The notebook fetches historical market data from Binance when it is executed.
 
-[Dataset source]
+The data includes standard cryptocurrency market information, such as OHLC price values and trading volume, depending on the selected trading pair and time window.
 
-After downloading, place the file in this directory.
+## 🔗 Data Source
+
+- **🌐 Source:** Binance API
+- **📅 Data type:** Historical
+- **⚙️ Retrieval:** Programmatically through the Binance API
+
+## 🔁 Reproducibility
+
+To reproduce the analysis, retrieve the required data from Binance before performing the analysis and model training.
