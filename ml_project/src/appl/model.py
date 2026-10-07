@@ -1,7 +1,5 @@
-# Initialize linear regression model
-
 class LinearRegressionModel:
-    def __init__(self, n_features, lr=0.00325, model_l2=0.425):
+    def __init__(self, n_features, lr=0.001, model_l2=0.0):
         self.w = np.zeros(n_features, dtype=float)
         self.b = 0.0
         self.lr = lr
