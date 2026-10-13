@@ -1,176 +1,90 @@
+# Coinbase ML Trading Bot — APPL strategy
 
-# ML Binance Trading Bot — based on `appl.ipynb`
+This rebuild keeps the same causal ML strategy and moves only the broker/data/execution layer to **Coinbase Global Derivatives**.
 
-This project converts the supplied `appl.ipynb` strategy into a small execution engine.
+## Why Global Derivatives?
 
-## What is preserved from the notebook
+This is the closest Coinbase equivalent to the Hyperliquid perpetual setup. As of October 1, 2026, Coinbase says Global Derivatives on Advanced Trade run through a Deribit-powered gateway. The official Coinbase Python SDK exposes `DeribitRetailClient` for this path.
 
-- `BTCUSDT` / configurable symbol
-- 1h / configurable bar size
-- return windows: 125, 150, 175, 200, 225, 250
-- future-return horizon: 37 by default
-- causal online linear regression
-- `LR=0.00325`
-- `MODEL_L2=0.425`
-- cost threshold logic
-- LONG / SHORT / FLAT signal logic
-- target notional = `EQUITY * LEVERAGE * RISK_PER_TRADE`
+## Important safety model
 
-Important: the notebook's `ASSUME_SIGNAL_FILLED=True` behavior is NOT used by the live engine.
-The exchange is the source of truth for the actual position.
+The exchange is the source of truth for:
+- account equity
+- available funds
+- current position
+- leverage / liquidation fields returned by the account state
+- open orders
 
-## Supported modes
+There is **no `EQUITY`, `LEVERAGE`, or account size hardcoded in `.env`**.
 
-### Futures
-- Binance USDT-M Futures
-- one-way position mode
-- LONG / SHORT / FLAT
-- MARKET orders
-- reduce-only closes
+`POSITION_FRACTION`, `MAX_POSITION_FRACTION`, and `MAX_LEVERAGE_CAP` are risk policy settings, not descriptions of the account. The bot calculates the actual target size from live account state.
 
-### Spot
-- Binance Spot
-- LONG / FLAT only
-- the project refuses to start Spot mode if `ALLOW_SHORTS=true`
+## Credentials
 
-## Safety
+Preferred:
+1. Create a Coinbase CDP API key.
+2. Download the JSON key file.
+3. Store that JSON **outside this repository**.
+4. Set `COINBASE_KEY_FILE` in `.env` to the file path, or set the same environment variable in PyCharm.
 
-The default configuration is:
+The official Coinbase SDK also supports `COINBASE_API_KEY` + `COINBASE_API_SECRET`.
 
-```text
-ENVIRONMENT=DEMO
-```
+Never commit the JSON key file or secret.
 
-For LIVE trading you must explicitly set:
+## First run
 
-```text
-ENVIRONMENT=LIVE
-LIVE_TRADING_CONFIRM=YES_I_UNDERSTAND
-```
-
-Never put API secrets into Git.
-
-For the first run, also use:
-
-```text
-DRY_RUN=true
-```
-
-The code will then calculate and log the intended orders without sending them.
-
-## Install
-
-Python 3.11+ is recommended.
-
-```bash
-python -m venv .venv
-```
-
-Linux/macOS:
-
-```bash
-source .venv/bin/activate
-```
-
-Windows:
-
-```powershell
-.venv\Scripts\activate
-```
-
-Then:
+Create a PyCharm virtual environment and install:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Copy:
+Copy `.env.example` to `.env`.
+
+Keep:
 
 ```text
-.env.example -> .env
-```
-
-and fill in the API key/secret from the appropriate Binance Demo environment.
-
-## First test
-
-Set:
-
-```text
-MARKET_TYPE=FUTURES
-ENVIRONMENT=DEMO
 DRY_RUN=true
 ```
 
-Then:
-
-```bash
-python run_once.py
-```
-
-You should get a prediction, signal, actual exchange position, and intended order information.
-
-When the behavior is correct:
+Then run:
 
 ```text
-DRY_RUN=false
-ENVIRONMENT=DEMO
+run_once.py
 ```
 
-and run:
+The bot should:
+1. authenticate with Coinbase,
+2. read account summary,
+3. read current positions/open orders,
+4. fetch closed 1h candles,
+5. run the causal ML model,
+6. print LONG/SHORT/FLAT,
+7. place no order because `DRY_RUN=true`.
 
-```bash
-python run_once.py
-```
+## Before enabling live orders
 
-This allows the bot to place orders in the Binance Demo environment.
+Run with a **view-only** API key first if possible. Confirm that account, positions and market data are correct.
 
-## 24/7 loop
+Only after the read-only flow is verified:
+- give the key trade permission,
+- set `DRY_RUN=false`,
+- set `LIVE_TRADING_CONFIRM=YES_I_UNDERSTAND`,
+- test with a very small position.
 
-```bash
-python run_bot.py
-```
+The project intentionally does not auto-retry an order when the network outcome is ambiguous. Each order gets a unique label so its state can be checked explicitly before any manual retry.
 
-Do not run two copies against the same account/symbol at the same time.
+## Strategy parameters
 
-## Going LIVE
+The ML layer is kept from the APPL logic:
+- return windows: 125, 150, 175, 200, 225, 250 bars
+- online linear model
+- horizon: 37 bars
+- learning rate: 0.00325
+- L2: 0.425
 
-Only after extensive Demo testing:
+## Notes
 
-```text
-ENVIRONMENT=LIVE
-LIVE_TRADING_CONFIRM=YES_I_UNDERSTAND
-DRY_RUN=false
-```
+Coinbase Advanced Trade and Global Derivatives are not the same API surface as the old INTX perpetuals API. The current SDK's Global Derivatives adapter is the appropriate integration path for perpetuals.
 
-Use a dedicated API key with only the permissions required for trading. Never enable withdrawal permissions for a trading bot.
-
-## Risk warning
-
-`RISK_PER_TRADE=0.10` in the original notebook is a target-notional rule. It is NOT a 10% stop-loss risk model. A 10% target notional and a 10% capital-at-risk stop-loss are very different things.
-
-Before live deployment, add/verify:
-- maximum daily loss
-- maximum position notional
-- maximum order frequency
-- stop-loss / liquidation protection
-- network/API failure handling
-- reconciliation after restarts
-- persistent order/fill logging
-- monitoring/alerts
-
-The current project deliberately does not invent a stop-loss model that was not present in your notebook.
-
-## Notebook
-
-`notebooks/appl/appl_reworked.ipynb` demonstrates:
-1. loading closed candles
-2. running the same causal ML prediction
-3. generating a signal
-4. showing the intended execution
-
-The notebook does not contain an automatic infinite live loop.
-
-## Binance API
-
-This project uses Binance's documented REST endpoints directly via `requests`, avoiding dependence on a third-party trading SDK.
+If you instead want **Coinbase Advanced Trade Spot**, that is a separate adapter and short positions are not available in the same way.
