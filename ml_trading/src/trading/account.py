@@ -1,5 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,15 +19,13 @@ class Position:
 
     @property
     def side(self) -> int:
-        if self.size > 0:
-            return 1
-        if self.size < 0:
-            return -1
-        return 0
+        return 1 if self.size > 0 else (-1 if self.size < 0 else 0)
 
     @property
     def notional(self) -> float:
-        return abs(self.position_value) if self.position_value else abs(self.size * (self.mark_price or 0.0))
+        return abs(self.position_value) if self.position_value else abs(
+            self.size * (self.mark_price or 0.0)
+        )
 
 
 @dataclass(frozen=True)
@@ -42,62 +41,100 @@ class AccountSnapshot:
         for position in self.positions:
             if position.instrument == instrument:
                 return position
-        return Position(
-            instrument=instrument,
-            size=0.0,
-            entry_price=None,
-            mark_price=None,
-            liquidation_price=None,
-            leverage=None,
-            margin_used=0.0,
-            position_value=0.0,
-            unrealized_pnl=0.0,
-        )
+        return Position(instrument, 0.0, None, None, None, None, 0.0, 0.0, 0.0)
 
 
 def as_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
     if isinstance(value, dict):
         return value
+    if value is None:
+        return {}
     if hasattr(value, "to_dict"):
-        try:
-            result = value.to_dict()
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            pass
+        result = value.to_dict()
+        if isinstance(result, dict):
+            return result
     if hasattr(value, "__dict__"):
-        return dict(value.__dict__)
-    return {}
+        result = dict(value.__dict__)
+        if result:
+            return result
+    raise ValueError(f"Expected an object/dict, got {type(value).__name__}")
 
 
 def result_payload(value: Any) -> Any:
+    if isinstance(value, dict) and "error" in value:
+        raise ValueError("API response contains an error")
+    if isinstance(value, dict) and "result" in value:
+        return value["result"]
     if hasattr(value, "result"):
         return value.result
     return value
 
 
-def _float(value: Any, default: float = 0.0) -> float:
+def _float(value: Any, default: float | None = None) -> float:
+    if value is None or isinstance(value, bool):
+        if default is not None:
+            return default
+        raise ValueError("Missing numeric value")
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if default is not None:
+            return default
+        raise ValueError(f"Invalid numeric value: {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError("Numeric value must be finite")
+    return number
+
+
+def _required_number(data: dict[str, Any], keys: tuple[str, ...], field: str) -> float:
+    for key in keys:
+        if key in data:
+            value = data[key]
+            if isinstance(value, dict):
+                if "value" in value:
+                    value = value["value"]
+                elif "amount" in value:
+                    value = value["amount"]
+                else:
+                    raise ValueError(f"Invalid {field} object")
+            return _float(value)
+    raise ValueError(f"Missing required account field: {field}")
+
+
+def _optional_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        if "value" in value:
+            value = value["value"]
+        elif "amount" in value:
+            value = value["amount"]
+        else:
+            raise ValueError("Invalid optional numeric object")
+    return _float(value)
 
 
 def parse_position(raw: dict[str, Any]) -> Position:
     raw = as_dict(raw)
-    size_raw = raw.get("size", raw.get("amount", raw.get("net_size", 0.0)))
-    size = _float(size_raw)
+
+    instrument = raw.get("instrument_name", raw.get("instrument", raw.get("symbol")))
+    if not isinstance(instrument, str) or not instrument.strip():
+        raise ValueError("Position is missing instrument name")
+
+    size_value = raw.get("size", raw.get("amount", raw.get("net_size")))
+    if size_value is None:
+        raise ValueError(f"Position {instrument} is missing size")
+    size = _float(size_value)
     direction = str(raw.get("direction", "")).lower()
     if direction == "sell" and size > 0:
         size = -size
-    if direction == "buy" and size < 0:
+    elif direction == "buy" and size < 0:
         size = abs(size)
 
-    position_value = _float(
-        raw.get("position_notional", raw.get("position_value", raw.get("size_usd", 0.0)))
-    )
+    position_value = _required_number(
+        raw, ("position_notional", "position_value", "size_usd"), "position value"
+    ) if any(k in raw for k in ("position_notional", "position_value", "size_usd")) else 0.0
+
     mark = raw.get("mark_price", raw.get("markPrice"))
     entry = raw.get("average_price", raw.get("entry_price", raw.get("entry_vwap")))
     liq = raw.get("estimated_liquidation_price", raw.get("liquidation_price"))
@@ -105,53 +142,66 @@ def parse_position(raw: dict[str, Any]) -> Position:
     upl = raw.get("floating_profit_loss", raw.get("unrealized_pnl", 0.0))
     margin = raw.get("initial_margin", raw.get("margin_used", raw.get("im_notional", 0.0)))
 
-    def unwrap(v: Any) -> Any:
-        if isinstance(v, dict):
-            for k in ("value", "amount"):
-                if k in v:
-                    return v[k]
-        return v
-
     return Position(
-        instrument=str(raw.get("instrument_name", raw.get("instrument", raw.get("symbol", "")))),
+        instrument=instrument,
         size=size,
-        entry_price=None if unwrap(entry) in (None, "") else _float(unwrap(entry)),
-        mark_price=None if unwrap(mark) in (None, "") else _float(unwrap(mark)),
-        liquidation_price=None if unwrap(liq) in (None, "") else _float(unwrap(liq)),
-        leverage=None if unwrap(lev) in (None, "") else _float(unwrap(lev)),
-        margin_used=_float(unwrap(margin)),
+        entry_price=_optional_number(entry),
+        mark_price=_optional_number(mark),
+        liquidation_price=_optional_number(liq),
+        leverage=_optional_number(lev),
+        margin_used=_float(margin),
         position_value=position_value,
-        unrealized_pnl=_float(unwrap(upl)),
+        unrealized_pnl=_float(upl),
     )
 
 
-def build_snapshot(account_id: str, summary_raw: Any, positions_raw: Any, orders_raw: Any) -> AccountSnapshot:
+def _collection(value: Any, keys: tuple[str, ...], field: str) -> list[Any]:
+    value = result_payload(value)
+    if isinstance(value, dict):
+        found = False
+        for key in keys:
+            if key in value:
+                value = value[key]
+                found = True
+                break
+        if not found:
+            raise ValueError(f"Response is missing {field} collection")
+    if not isinstance(value, list):
+        raise ValueError(f"Expected {field} to be a list")
+    return value
+
+
+def build_snapshot(
+    account_id: str, summary_raw: Any, positions_raw: Any, orders_raw: Any
+) -> AccountSnapshot:
     summary = as_dict(result_payload(summary_raw))
-    positions_payload = result_payload(positions_raw)
-    orders_payload = result_payload(orders_raw)
 
-    if isinstance(positions_payload, dict):
-        positions_payload = positions_payload.get("positions", positions_payload.get("data", []))
-    if isinstance(orders_payload, dict):
-        orders_payload = orders_payload.get("orders", orders_payload.get("data", []))
-    if not isinstance(positions_payload, list):
-        positions_payload = []
-    if not isinstance(orders_payload, list):
-        orders_payload = []
-
-    equity = summary.get("equity", summary.get("balance", summary.get("margin_balance", 0.0)))
-    available = summary.get(
-        "available_funds",
-        summary.get("available_withdrawal", summary.get("withdrawable", 0.0)),
+    equity = _required_number(
+        summary, ("equity", "balance", "margin_balance"), "equity"
     )
-    margin = summary.get("initial_margin", summary.get("total_margin_used", 0.0))
+    available = _required_number(
+        summary,
+        ("available_funds", "available_withdrawal", "withdrawable"),
+        "available funds",
+    )
+    margin = _required_number(
+        summary, ("initial_margin", "total_margin_used"), "total margin"
+    )
+
+    positions_payload = _collection(
+        positions_raw, ("positions", "data"), "positions"
+    )
+    orders_payload = _collection(orders_raw, ("orders", "data"), "orders")
+
     positions = tuple(parse_position(item) for item in positions_payload)
+    if any(not isinstance(item, dict) for item in orders_payload):
+        raise ValueError("Open orders collection contains a malformed entry")
 
     return AccountSnapshot(
         account_id=account_id,
-        account_value=_float(equity),
-        available_funds=_float(available),
-        total_margin_used=_float(margin),
+        account_value=equity,
+        available_funds=available,
+        total_margin_used=margin,
         positions=positions,
-        open_orders=tuple(item for item in orders_payload if isinstance(item, dict)),
+        open_orders=tuple(orders_payload),
     )

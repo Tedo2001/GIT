@@ -1,149 +1,270 @@
+
 from __future__ import annotations
 
 import json
+import math
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from coinbase.deribit import DeribitRetailClient
+from coinbase.deribit.rest_client import DeribitRetailClient
 
-from .account import AccountSnapshot, build_snapshot, result_payload, as_dict
+from .account import AccountSnapshot, as_dict, build_snapshot, result_payload
 from .config import Settings
-from .market_data import interval_to_ms, normalize_chart_data
+from .market_data import _resolution, normalize_chart_data
 
 
 class CoinbaseBroker:
-    """Coinbase Global Derivatives adapter.
-
-    Global Derivatives on Coinbase Advanced Trade use Coinbase's
-    Deribit-powered gateway. This class keeps all exchange-specific
-    details out of the strategy/model layers.
-    """
+    """Broker adapter for Coinbase Global Derivatives."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        if settings.key_file:
-            key_path = Path(settings.key_file)
-            if not key_path.exists():
-                raise FileNotFoundError(f"Coinbase key file not found: {key_path}")
-            self.client = DeribitRetailClient(key_file=str(key_path))
+
+        kwargs: dict[str, Any] = {
+            "environment": "production",
+        }
+
+        if settings.key_file is not None:
+            kwargs["key_file"] = str(settings.key_file)
+        elif settings.api_key and settings.api_secret:
+            kwargs["api_key"] = settings.api_key
+            kwargs["api_secret"] = settings.api_secret
         else:
-            self.client = DeribitRetailClient(
-                api_key=settings.api_key,
-                api_secret=settings.api_secret,
+            raise ValueError(
+                "Missing credentials. Set COINBASE_KEY_FILE or "
+                "COINBASE_API_KEY and COINBASE_API_SECRET."
             )
 
+        self.client = DeribitRetailClient(**kwargs)
+
     @staticmethod
-    def _payload(value: Any) -> Any:
-        return result_payload(value)
+    def _payload(response: Any) -> Any:
+        return result_payload(response)
+
+    @staticmethod
+    def _number(value: Any, field: str) -> float:
+        if isinstance(value, dict):
+            if "value" in value:
+                value = value["value"]
+            elif "amount" in value:
+                value = value["amount"]
+
+        if isinstance(value, bool) or value is None:
+            raise ValueError(f"Missing or invalid numeric field: {field}")
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid numeric field: {field}") from exc
+
+        if not math.isfinite(number):
+            raise ValueError(f"Non-finite numeric field: {field}")
+
+        return number
 
     def account_snapshot(self) -> AccountSnapshot:
-        summary = self.client.private_get_account_summary(currency=self.settings.currency)
-        positions = self.client.private_get_positions(currency=self.settings.currency)
-        orders = self.client.private_get_open_orders(instrument_name=self.settings.instrument)
+        currency = self.settings.currency
+
+        summary = self.client.private_get_account_summary(
+            currency=currency,
+            extended=True,
+        )
+        positions = self.client.private_get_positions(
+            currency=currency,
+            kind="future",
+        )
+        orders = self.client.private_get_open_orders(
+            kind="future",
+        )
+
         return build_snapshot(
-            account_id=self.settings.instrument,
+            account_id=currency,
             summary_raw=summary,
             positions_raw=positions,
             orders_raw=orders,
         )
 
-    def candles(self, instrument: str, interval: str, limit: int):
-        end_ms = int(time.time() * 1000)
-        start_ms = end_ms - int(limit * interval_to_ms(interval) * 1.2)
-        response = self.client.call(
-            "public/get_tradingview_chart_data",
-            {
-                "instrument_name": instrument,
-                "start_timestamp": start_ms,
-                "end_timestamp": end_ms,
-                "resolution": _resolution(interval),
-            },
-        )
-        raw = self._payload(response)
-        if isinstance(raw, dict) and "result" in raw:
-            raw = raw["result"]
-        return normalize_chart_data(raw, now_ms=end_ms)
+    def format_account(self, account: AccountSnapshot) -> str:
+        position = account.position_for(self.settings.instrument)
 
+        return (
+            f"Account currency={self.settings.currency} "
+            f"equity={account.account_value:.4f} "
+            f"available={account.available_funds:.4f} "
+            f"margin_used={account.total_margin_used:.4f} "
+            f"instrument={position.instrument} "
+            f"position_size={position.size:.8f} "
+            f"position_side={position.side}"
+        )
+
+    def candles(
+        self,
+        instrument: str,
+        interval: str,
+        limit: int,
+    ):
+        if limit < 2:
+            raise ValueError("Candle limit must be at least 2")
+
+        resolution = _resolution(interval)
+        now_ms = int(time.time() * 1000)
+
+        # Request enough history for the desired candle count, plus a buffer.
+        interval_ms = {
+            "1m": 60_000,
+            "5m": 300_000,
+            "15m": 900_000,
+            "30m": 1_800_000,
+            "1h": 3_600_000,
+            "2h": 7_200_000,
+            "4h": 14_400_000,
+            "1d": 86_400_000,
+        }.get(interval)
+
+        if interval_ms is None:
+            raise ValueError(f"Unsupported candle interval: {interval}")
+
+        end_ms = now_ms
+        start_ms = end_ms - interval_ms * (limit + 2)
+
+        response = self.client.public_get_tradingview_chart_data(
+            instrument_name=instrument,
+            start_timestamp=start_ms,
+            end_timestamp=end_ms,
+            resolution=resolution,
+        )
+
+        data = as_dict(self._payload(response))
+
+        # The endpoint is expected to return TradingView chart arrays.
+        # Fail closed if the actual response differs from that schema.
+        required = ("ticks", "open", "high", "low", "close")
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(
+                "TradingView chart response is missing fields: "
+                + ", ".join(missing)
+            )
+
+        frame = normalize_chart_data(data, now_ms=now_ms)
+        return frame.tail(limit).copy()
 
     def mark_price(self, instrument: str) -> float:
-        ticker = self.client.public_ticker(instrument_name=instrument)
-        result = self._payload(ticker)
-        data = as_dict(result)
-        if "mark_price" in data:
-            return float(data["mark_price"])
-        if "last_price" in data:
-            return float(data["last_price"])
-        if isinstance(result, dict):
-            for key in ("mark_price", "last_price", "close"):
-                if key in result:
-                    return float(result[key])
-        raise ValueError(f"Could not extract mark price for {instrument}")
+        response = self.client.public_ticker(
+            instrument_name=instrument,
+        )
+        data = as_dict(self._payload(response))
+
+        for key in ("mark_price", "last_price"):
+            if key in data:
+                value = self._number(data[key], key)
+                if value > 0:
+                    return value
+
+        raise ValueError(
+            f"Ticker for {instrument} has no valid mark or last price"
+        )
 
     def instrument_meta(self, instrument: str) -> dict[str, Any]:
-        response = self.client.call("public/get_instrument", {"instrument_name": instrument})
-        data = self._payload(response)
-        if isinstance(data, dict) and "result" in data:
-            data = data["result"]
-        return as_dict(data)
+        response = self.client.public_get_instrument(
+            instrument_name=instrument,
+        )
+        data = as_dict(self._payload(response))
+
+        if not data:
+            raise ValueError(
+                f"Empty instrument metadata response for {instrument}"
+            )
+
+        return data
 
     def amount_precision(self, instrument: str) -> int:
         meta = self.instrument_meta(instrument)
-        if "amount_precision" in meta:
-            return int(meta["amount_precision"])
-        return 6
+
+        # Do not infer quantity increments from minimum trade size.
+        # These are different instrument properties.
+        if "amount_precision" not in meta:
+            raise ValueError(
+                f"Cannot safely determine amount precision for {instrument}; "
+                "instrument metadata has no amount_precision. "
+                "Verify the API's quantity increment before trading."
+            )
+
+        precision = int(meta["amount_precision"])
+        if precision < 0:
+            raise ValueError(
+                f"Invalid amount_precision in metadata for {instrument}"
+            )
+
+        return precision
 
     def min_trade_amount(self, instrument: str) -> float:
         meta = self.instrument_meta(instrument)
+
         for key in ("min_trade_amount", "min_amount", "min_trade_size"):
             if key in meta:
-                return float(meta[key])
-        return 0.0
+                amount = self._number(meta[key], key)
+                if amount <= 0:
+                    raise ValueError(
+                        f"Invalid {key} in instrument metadata for {instrument}"
+                    )
+                return amount
 
-    def fee_rate(self) -> float:
-        # The global derivatives gateway does not expose a stable typed
-        # account-fee helper in all SDK versions, so use the configured
-        # fallback until Coinbase provides a dedicated typed field.
-        return self.settings.taker_fee_rate_fallback
-
-    def open_market(self, instrument: str, is_buy: bool, amount: float, label: str):
-        method = self.client.private_buy if is_buy else self.client.private_sell
-        return method(
-            instrument_name=instrument,
-            amount=amount,
-            type="market",
-            label=label,
+        raise ValueError(
+            f"Missing minimum trade amount in metadata for {instrument}"
         )
 
-    def close_position(self, instrument: str, label: str):
-        return self.client.private_close_position(instrument_name=instrument, label=label)
+    def fee_rate(self) -> float:
+        instrument = self.settings.instrument
 
-    def order_state_by_label(self, label: str):
-        return self.client.private_get_order_state_by_label(label=label)
+        try:
+            meta = self.instrument_meta(instrument)
+            value = meta.get("taker_commission")
+            if value is not None:
+                fee = self._number(value, "taker_commission")
+                if fee >= 0:
+                    return fee
+        except (ValueError, TypeError, KeyError):
+            pass
 
-    def format_account(self, snapshot: AccountSnapshot) -> str:
-        rows = [
-            f"Coinbase instrument: {self.settings.instrument}",
-            f"Account value (USDC): ${snapshot.account_value:,.4f}",
-            f"Available funds: ${snapshot.available_funds:,.4f}",
-            f"Margin used: ${snapshot.total_margin_used:,.4f}",
-        ]
-        position = snapshot.position_for(self.settings.instrument)
-        if position.side:
-            rows.append(
-                f"Position: size={position.size} side={position.side} "
-                f"entry={position.entry_price} mark={position.mark_price} "
-                f"liq={position.liquidation_price} lev={position.leverage} "
-                f"uPnL=${position.unrealized_pnl:,.4f}"
+        fallback = float(self.settings.taker_fee_rate_fallback)
+        if not math.isfinite(fallback) or fallback < 0:
+            raise ValueError("Invalid configured taker fee fallback")
+
+        return fallback
+
+    def open_market(
+        self,
+        instrument: str,
+        is_buy: bool,
+        amount: float,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        if self.settings.dry_run:
+            raise RuntimeError(
+                "Order submission blocked: DRY_RUN=True. "
+                "This method must not be called in dry-run mode."
             )
-        else:
-            rows.append("Position: FLAT")
-        rows.append(f"Open orders on instrument: {len(snapshot.open_orders)}")
-        return "\n".join(rows)
 
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("Order amount must be finite and positive")
 
-def _resolution(interval: str) -> str:
-    mapping = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "1D"}
-    if interval not in mapping:
-        raise ValueError(f"Unsupported interval {interval}")
-    return mapping[interval]
+        # No live submission until amount-vs-contracts units are verified.
+        raise RuntimeError(
+            "Live order submission is deliberately disabled in this "
+            "recovery build. Verify the instrument's amount/contracts units "
+            "and private API authentication before implementing execution."
+        )
+
+    def close_position(self, instrument: str) -> dict[str, Any]:
+        if self.settings.dry_run:
+            raise RuntimeError(
+                "Position closing blocked: DRY_RUN=True."
+            )
+
+        raise RuntimeError(
+            "Live position closing is deliberately disabled in this "
+            "recovery build until authentication and execution semantics "
+            "are verified."
+        )
