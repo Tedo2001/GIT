@@ -1,14 +1,12 @@
 
 from __future__ import annotations
 
-import json
 import math
 import time
-import uuid
-from pathlib import Path
 from typing import Any
 
 from coinbase.deribit.rest_client import DeribitRetailClient
+from coinbase.deribit.ws_client import DeribitRetailWSClient
 
 from .account import AccountSnapshot, as_dict, build_snapshot, result_payload
 from .config import Settings
@@ -37,6 +35,7 @@ class CoinbaseBroker:
             )
 
         self.client = DeribitRetailClient(**kwargs)
+        self.market_data_client = DeribitRetailWSClient(**kwargs)
 
     @staticmethod
     def _payload(response: Any) -> Any:
@@ -128,19 +127,26 @@ class CoinbaseBroker:
         end_ms = now_ms
         start_ms = end_ms - interval_ms * (limit + 2)
 
-        response = self.client.public_get_tradingview_chart_data(
-            instrument_name=instrument,
-            start_timestamp=start_ms,
-            end_timestamp=end_ms,
-            resolution=resolution,
-        )
+        # Open the WebSocket before requesting chart data.
+        self.market_data_client.open()
+        try:
+            response = (
+                self.market_data_client.public_get_tradingview_chart_data(
+                    instrument_name=instrument,
+                    start_timestamp=start_ms,
+                    end_timestamp=end_ms,
+                    resolution=resolution,
+                )
+            )
+        finally:
+            self.market_data_client.close()
 
         data = as_dict(self._payload(response))
 
-        # The endpoint is expected to return TradingView chart arrays.
-        # Fail closed if the actual response differs from that schema.
+        # Fail closed if the response differs from the expected schema.
         required = ("ticks", "open", "high", "low", "close")
         missing = [key for key in required if key not in data]
+
         if missing:
             raise ValueError(
                 "TradingView chart response is missing fields: "
@@ -183,7 +189,6 @@ class CoinbaseBroker:
         meta = self.instrument_meta(instrument)
 
         # Do not infer quantity increments from minimum trade size.
-        # These are different instrument properties.
         if "amount_precision" not in meta:
             raise ValueError(
                 f"Cannot safely determine amount precision for {instrument}; "
@@ -212,7 +217,7 @@ class CoinbaseBroker:
                 return amount
 
         raise ValueError(
-            f"Missing minimum trade amount in metadata for {instrument}"
+            f"Missing minimum trade amount in instrument metadata for {instrument}"
         )
 
     def fee_rate(self) -> float:
@@ -250,7 +255,7 @@ class CoinbaseBroker:
         if not math.isfinite(amount) or amount <= 0:
             raise ValueError("Order amount must be finite and positive")
 
-        # No live submission until amount-vs-contracts units are verified.
+        # No live submission until amount-versus-contract units are verified.
         raise RuntimeError(
             "Live order submission is deliberately disabled in this "
             "recovery build. Verify the instrument's amount/contracts units "
